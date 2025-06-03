@@ -34,7 +34,8 @@ app.use(session({
   cookie: {
     maxAge: 1000 * 60 * 60 * 24, // 1 day
     secure: process.env.NODE_ENV === 'production',
-    httpOnly: true
+    httpOnly: true,
+    sameSite: 'lax' // Important for cross-site cookies
   }
 }));
 
@@ -142,7 +143,15 @@ app.post('/admin/login', async (req, res) => {
       email: admin.email
     };
     
-    res.json({ success: true, redirect: '/admin/dashboard' });
+    // Explicitly save session before responding
+    req.session.save((err) => {
+      if (err) {
+        console.error('Session save error:', err);
+        return res.status(500).json({ success: false, message: 'Session error' });
+      }
+      res.json({ success: true, redirect: '/admin/dashboard' });
+    });
+    
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, message: 'Server error' });
