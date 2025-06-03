@@ -137,6 +137,7 @@
                         'Content-Type': 'application/json',
                     },
                     body: JSON.stringify({ email, password }),
+                    credentials: 'include' // Important for sessions
                 });
                 
                 const data = await response.json();
@@ -150,6 +151,7 @@
             } catch (err) {
                 errorMessage.textContent = 'Network error. Please try again.';
                 errorAlert.classList.remove('d-none');
+                console.error('Login error:', err);
             } finally {
                 loginBtn.disabled = false;
                 loginText.classList.remove('d-none');
