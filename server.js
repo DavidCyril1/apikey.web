@@ -1,403 +1,399 @@
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
-const session = require('express-session');
-const MongoStore = require('connect-mongo');
-const path = require('path');
-const crypto = require('crypto');
+const cors = require('cors');
+const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const app = express();
+const morgan = require('morgan');
+const crypto = require('crypto');
+const path = require('path');
+const passport = require('passport');
+const LocalStrategy = require('passport-local').Strategy;
+const session = require('express-session');
+const jwt = require('jsonwebtoken');
+const winston = require('winston');
 
-// MongoDB Connection
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/apiKeyDB', {
+// Initialize Express app
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Configure Winston logger
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: 'error.log', level: 'error' }),
+    new winston.transports.File({ filename: 'combined.log' })
+  ],
+});
+
+// MongoDB connection
+mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true
-});
+})
+.then(() => logger.info('Connected to MongoDB Database'))
+.catch(err => logger.error('MongoDB connection error:', err));
 
-const db = mongoose.connection;
-db.on('error', console.error.bind(console, 'MongoDB connection error:'));
-db.once('open', () => console.log('Connected to MongoDB'));
-
-// Session Store
-const sessionStore = MongoStore.create({
-  mongoUrl: process.env.MONGODB_URI || 'mongodb://localhost:27017/apiKeyDB',
-  collectionName: 'sessions'
-});
-
-// Session Configuration
-app.use(session({
-  secret: process.env.SESSION_SECRET || 'your-secret-key',
-  resave: false,
-  saveUninitialized: false,
-  store: sessionStore,
-  cookie: {
-    maxAge: 1000 * 60 * 60 * 24, // 1 day
-    secure: process.env.NODE_ENV === 'production',
-    httpOnly: true,
-    sameSite: 'lax' // Important for cross-site cookies
-  }
-}));
-
-// Models
-const AdminSchema = new mongoose.Schema({
-  email: { type: String, required: true, unique: true },
-  password: { type: String, required: true },
-  createdAt: { type: Date, default: Date.now },
-  lastLogin: Date
-});
-
-const ApiKeySchema = new mongoose.Schema({
-  key: { type: String, required: true, unique: true },
-  owner: { type: String, required: true },
-  email: { type: String, required: true },
-  createdAt: { type: Date, default: Date.now },
-  expiresAt: Date,
+// API Key Schema
+const apiKeySchema = new mongoose.Schema({
+  key: { 
+    type: String, 
+    required: true, 
+    unique: true 
+  },
+  owner: { 
+    type: String, 
+    required: true 
+  },
+  ownerName: {
+    type: String,
+    required: true
+  },
+  createdAt: { 
+    type: Date, 
+    default: Date.now 
+  },
   lastUsed: Date,
-  isActive: { type: Boolean, default: true },
-  usageCount: { type: Number, default: 0 },
-  rateLimit: { type: Number, default: 100 },
-  tier: { type: String, enum: ['free', 'basic', 'pro', 'enterprise'], default: 'free' },
-  paymentId: String,
-  paymentMethod: String
+  isActive: { 
+    type: Boolean, 
+    default: true 
+  },
+  usageCount: { 
+    type: Number, 
+    default: 0 
+  },
+  rateLimit: { 
+    type: Number, 
+    default: 100 
+  },
+  plan: {
+    type: String,
+    enum: ['basic', 'pro', 'enterprise', 'custom'],
+    default: 'basic'
+  },
+  paymentReference: String,
+  description: String
 });
 
-const PaymentSchema = new mongoose.Schema({
-  email: String,
-  amount: Number,
-  currency: String,
-  paymentId: String,
-  paymentMethod: String,
-  status: { type: String, default: 'pending' },
-  createdAt: { type: Date, default: Date.now },
-  apiKeyId: mongoose.Schema.Types.ObjectId
-});
-
-const Admin = mongoose.model('Admin', AdminSchema);
-const ApiKey = mongoose.model('ApiKey', ApiKeySchema);
-const Payment = mongoose.model('Payment', PaymentSchema);
-
-// Initialize Admin Account
-async function initializeAdminAccount() {
-  const adminEmail = process.env.ADMIN_EMAIL || 'davidcyril209@gmail.com';
-  const adminPassword = process.env.ADMIN_PASSWORD || '85200555';
-  
-  const existingAdmin = await Admin.findOne({ email: adminEmail });
-  if (!existingAdmin) {
-    const hashedPassword = await bcrypt.hash(adminPassword, 12);
-    await Admin.create({
-      email: adminEmail,
-      password: hashedPassword
-    });
-    console.log('Default admin account created');
-  }
-}
+const ApiKey = mongoose.model('ApiKey', apiKeySchema);
 
 // Middleware
+app.use(helmet());
+app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
+app.use(morgan('combined', { stream: { write: message => logger.info(message.trim()) } }));
 
-// Authentication Middleware
-const requireAuth = (req, res, next) => {
-  if (!req.session.admin) {
-    if (req.originalUrl.startsWith('/admin/api')) {
-      return res.status(401).json({ success: false, message: 'Unauthorized' });
-    }
-    return res.redirect('/admin/login');
+// Rate limiting
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: {
+    creator: "David Cyril",
+    success: false,
+    status: 429,
+    message: "Too many requests, please try again later."
   }
-  next();
-};
-
-// Routes
-
-// Admin Login
-app.get('/admin/login', (req, res) => {
-  if (req.session.admin) {
-    return res.redirect('/admin/dashboard');
-  }
-  res.sendFile(path.join(__dirname, 'public', 'admin-login.html'));
 });
 
-app.post('/admin/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const admin = await Admin.findOne({ email });
-    
-    if (!admin) {
-      return res.status(401).json({ success: false, message: 'Invalid credentials' });
-    }
-    
-    const isMatch = await bcrypt.compare(password, admin.password);
-    if (!isMatch) {
-      return res.status(401).json({ success: false, message: 'Invalid credentials' });
-    }
-    
-    // Update last login
-    admin.lastLogin = new Date();
-    await admin.save();
-    
-    // Create session
-    req.session.admin = {
-      id: admin._id,
-      email: admin.email
-    };
-    
-    // Explicitly save session before responding
-    req.session.save((err) => {
-      if (err) {
-        console.error('Session save error:', err);
-        return res.status(500).json({ success: false, message: 'Session error' });
+// Session configuration for admin panel
+app.use(session({
+  secret: process.env.JWT_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: { 
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: 24 * 60 * 60 * 1000 // 24 hours
+  }
+}));
+
+// Passport configuration for admin authentication
+passport.use(new LocalStrategy(
+  { usernameField: 'email' },
+  async (email, password, done) => {
+    try {
+      if (email === process.env.ADMIN_EMAIL && password === process.env.ADMIN_PASSWORD) {
+        return done(null, {
+          email: process.env.ADMIN_EMAIL,
+          name: 'David Cyril',
+          role: 'admin'
+        });
+      } else {
+        return done(null, false, { message: 'Invalid email or password' });
       }
-      res.json({ success: true, redirect: '/admin/dashboard' });
+    } catch (err) {
+      return done(err);
+    }
+  }
+));
+
+passport.serializeUser((user, done) => {
+  done(null, user.email);
+});
+
+passport.deserializeUser(async (email, done) => {
+  if (email === process.env.ADMIN_EMAIL) {
+    done(null, {
+      email: process.env.ADMIN_EMAIL,
+      name: 'David Cyril',
+      role: 'admin'
     });
-    
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, message: 'Server error' });
+  } else {
+    done(new Error('User not found'));
   }
 });
 
-app.get('/admin/logout', (req, res) => {
-  req.session.destroy(err => {
-    if (err) {
-      return res.status(500).send('Could not log out');
-    }
-    res.redirect('/admin/login');
-  });
-});
-
-// Admin Dashboard
-app.get('/admin/dashboard', requireAuth, (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'admin-dashboard.html'));
-});
-
-// Payment Page
-app.get('/payment-page', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'payment-page.html'));
-});
+app.use(passport.initialize());
+app.use(passport.session());
 
 // API Routes
-app.get('/admin/api/keys', requireAuth, async (req, res) => {
+app.use('/api', apiLimiter);
+
+// API Key verification middleware
+app.use('/api', async (req, res, next) => {
   try {
-    const keys = await ApiKey.find({}).sort({ createdAt: -1 });
-    res.json({ success: true, data: keys });
+    const apiKey = req.query.apikey || req.headers['x-api-key'];
+    
+    if (!apiKey) {
+      return res.status(401).json({
+        creator: "David Cyril",
+        success: false,
+        status: 401,
+        message: "API key is required. Please include an apikey parameter or x-api-key header."
+      });
+    }
+
+    const keyRecord = await ApiKey.findOne({ key: apiKey, isActive: true });
+    
+    if (!keyRecord) {
+      return res.status(403).json({
+        creator: "David Cyril",
+        success: false,
+        status: 403,
+        message: "Invalid API key. Please provide a valid key."
+      });
+    }
+
+    // Update usage statistics
+    keyRecord.lastUsed = new Date();
+    keyRecord.usageCount += 1;
+    await keyRecord.save();
+
+    // Attach key info to request for later use
+    req.apiKeyInfo = {
+      owner: keyRecord.owner,
+      rateLimit: keyRecord.rateLimit
+    };
+
+    next();
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Failed to fetch API keys' });
+    logger.error('API key verification error:', err);
+    return res.status(500).json({
+      creator: "David Cyril",
+      success: false,
+      status: 500,
+      message: "Internal server error during API key verification."
+    });
   }
 });
 
-app.post('/admin/api/keys', requireAuth, async (req, res) => {
+// Payment verification endpoint
+app.post('/api/verify-payment', async (req, res) => {
   try {
-    const { owner, email, tier, rateLimit } = req.body;
+    const { transactionId, gateway, plan } = req.body;
     
-    // Generate a secure random API key
-    const key = crypto.randomBytes(32).toString('hex');
+    // In a real implementation, verify with payment provider's API
+    // This is a simplified version
+    logger.info(`Verifying ${gateway} payment: ${transactionId}`);
     
+    let verified = false;
+    
+    if (gateway === 'paystack' || gateway === 'flutterwave') {
+      // Simulate verification for demo
+      verified = true;
+    }
+    
+    if (verified) {
+      res.json({
+        success: true,
+        plan: plan
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        message: "Payment verification failed"
+      });
+    }
+  } catch (err) {
+    logger.error('Payment verification error:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Payment verification failed'
+    });
+  }
+});
+
+// Generate API key endpoint
+app.post('/api/generate-key', async (req, res) => {
+  try {
+    const { email, name, rateLimit, plan, paymentReference } = req.body;
+    
+    // Generate a secure API key
+    const apiKeyValue = `api_${crypto.randomBytes(16).toString('hex')}`;
+    
+    // Create key record
     const newKey = new ApiKey({
-      key,
-      owner,
-      email,
-      tier: tier || 'free',
-      rateLimit: rateLimit || 100,
-      expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) // 1 year from now
+      key: apiKeyValue,
+      owner: email,
+      ownerName: name,
+      rateLimit: rateLimit,
+      plan: plan,
+      paymentReference: paymentReference
     });
     
     await newKey.save();
     
-    res.json({ success: true, data: newKey });
+    logger.info(`Generated new API key for ${email}`);
+    
+    res.json({
+      success: true,
+      apiKey: newKey
+    });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Failed to create API key' });
+    logger.error('Error generating API key:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to generate API key'
+    });
   }
 });
 
-app.put('/admin/api/keys/:id', requireAuth, async (req, res) => {
+// Get API key details
+app.get('/api/key-details', async (req, res) => {
   try {
-    const { isActive, rateLimit, tier } = req.body;
-    const key = await ApiKey.findByIdAndUpdate(
-      req.params.id,
-      { isActive, rateLimit, tier },
-      { new: true }
-    );
+    const keyId = req.query.id;
+    const key = await ApiKey.findOne({ _id: keyId });
     
     if (!key) {
-      return res.status(404).json({ success: false, message: 'API key not found' });
+      return res.status(404).json({
+        success: false,
+        message: 'API key not found'
+      });
     }
     
-    res.json({ success: true, data: key });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Failed to update API key' });
-  }
-});
-
-app.delete('/admin/api/keys/:id', requireAuth, async (req, res) => {
-  try {
-    await ApiKey.findByIdAndDelete(req.params.id);
-    res.json({ success: true, message: 'API key deleted' });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Failed to delete API key' });
-  }
-});
-
-// Payment Routes
-app.get('/admin/api/payments', requireAuth, async (req, res) => {
-  try {
-    const payments = await Payment.find({}).sort({ createdAt: -1 });
-    res.json({ success: true, data: payments });
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Failed to fetch payments' });
-  }
-});
-
-// Payment Verification Webhook
-app.post('/api/verify-payment', async (req, res) => {
-  try {
-    const { paymentId, paymentMethod, email, amount, currency, status } = req.body;
-    
-    // In a real application, verify payment with payment gateway here
-    const paymentVerified = true; // Placeholder
-    
-    if (paymentVerified) {
-      // Create payment record
-      const payment = new Payment({
-        email,
-        amount,
-        currency,
-        paymentId,
-        paymentMethod,
-        status: status || 'completed'
-      });
-      
-      await payment.save();
-      
-      // Generate API key
-      const key = crypto.randomBytes(32).toString('hex');
-      const newKey = new ApiKey({
-        key,
-        owner: email.split('@')[0],
-        email,
-        tier: getTierFromAmount(amount),
-        paymentId,
-        paymentMethod,
-        expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 days
-      });
-      
-      await newKey.save();
-      
-      // Link payment to API key
-      payment.apiKeyId = newKey._id;
-      await payment.save();
-      
-      return res.json({ 
-        success: true, 
-        key,
-        tier: newKey.tier,
-        expiresAt: newKey.expiresAt
-      });
-    } else {
-      return res.status(400).json({ success: false, message: 'Payment verification failed' });
-    }
-  } catch (err) {
-    console.error('Payment verification error:', err);
-    res.status(500).json({ success: false, message: 'Payment verification error' });
-  }
-});
-
-// Helper function to determine tier based on payment amount
-function getTierFromAmount(amount) {
-  if (amount >= 2500) return 'enterprise';
-  if (amount >= 1200) return 'pro';
-  if (amount >= 500) return 'basic';
-  return 'free';
-}
-
-// API Key Validation Middleware
-app.use('/api', async (req, res, next) => {
-  const apiKey = req.headers['x-api-key'] || req.query.apiKey;
-  
-  if (!apiKey) {
-    return res.status(401).json({ 
-      success: false,
-      message: 'API key is required'
+    res.json({
+      success: true,
+      apiKey: key
     });
-  }
-  
-  try {
-    const keyRecord = await ApiKey.findOne({ key: apiKey, isActive: true });
-    
-    if (!keyRecord) {
-      return res.status(403).json({ 
-        success: false,
-        message: 'Invalid API key'
-      });
-    }
-    
-    // Check if key has expired
-    if (keyRecord.expiresAt && new Date() > keyRecord.expiresAt) {
-      return res.status(403).json({ 
-        success: false,
-        message: 'API key has expired'
-      });
-    }
-    
-    // Update usage stats
-    keyRecord.lastUsed = new Date();
-    keyRecord.usageCount += 1;
-    await keyRecord.save();
-    
-    // Attach key info to request
-    req.apiKey = {
-      tier: keyRecord.tier,
-      rateLimit: keyRecord.rateLimit,
-      owner: keyRecord.owner
-    };
-    
-    next();
   } catch (err) {
-    console.error('API key validation error:', err);
-    res.status(500).json({ 
+    logger.error('Error fetching API key details:', err);
+    res.status(500).json({
       success: false,
-      message: 'Internal server error'
+      message: 'Failed to fetch API key details'
     });
   }
 });
 
-// Rate Limiting Middleware
-const apiLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: (req) => req.apiKey?.rateLimit || 100, // Use key's rate limit or default
-  message: {
-    success: false,
-    message: 'Too many requests, please try again later.'
+// Admin routes
+const ensureAuthenticated = (req, res, next) => {
+  if (req.isAuthenticated()) {
+    return next();
   }
-});
-app.use('/api', apiLimiter);
+  res.status(401).json({ success: false, message: 'Unauthorized' });
+};
 
-// Example API Endpoint
-app.get('/api/data', (req, res) => {
+// Admin login
+app.post('/admin/login', passport.authenticate('local'), (req, res) => {
+  const token = jwt.sign(
+    { email: req.user.email, role: req.user.role },
+    process.env.JWT_SECRET,
+    { expiresIn: process.env.JWT_EXPIRES_IN }
+  );
+  
   res.json({
     success: true,
-    data: {
-      message: 'This is protected data',
-      tier: req.apiKey.tier,
-      owner: req.apiKey.owner
-    }
+    token,
+    user: req.user
   });
 });
 
-// Initialize and Start Server
-async function startServer() {
-  await initializeAdminAccount();
-  
-  const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`Admin dashboard: http://localhost:${PORT}/admin/login`);
-    console.log(`Payment page: http://localhost:${PORT}/payment-page`);
-  });
-}
+// Admin logout
+app.post('/admin/logout', (req, res) => {
+  req.logout();
+  res.json({ success: true, message: 'Logged out successfully' });
+});
 
-startServer().catch(err => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
+// Admin API key management
+app.get('/admin/api-keys', ensureAuthenticated, async (req, res) => {
+  try {
+    const keys = await ApiKey.find({});
+    res.json({
+      success: true,
+      data: keys
+    });
+  } catch (err) {
+    logger.error('Error fetching API keys:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to retrieve API keys'
+    });
+  }
+});
+
+app.post('/admin/api-keys', ensureAuthenticated, async (req, res) => {
+  try {
+    const newKey = new ApiKey({
+      key: `api_${crypto.randomBytes(16).toString('hex')}`,
+      owner: req.body.owner,
+      ownerName: req.body.ownerName,
+      description: req.body.description,
+      rateLimit: req.body.rateLimit || 100,
+      plan: req.body.plan || 'custom'
+    });
+    
+    await newKey.save();
+    
+    logger.info(`Admin created new API key for ${req.body.owner}`);
+    
+    res.status(201).json({
+      success: true,
+      data: newKey
+    });
+  } catch (err) {
+    logger.error('Error creating API key:', err);
+    res.status(400).json({
+      success: false,
+      message: "Failed to create API key"
+    });
+  }
+});
+
+// Serve static files for the frontend
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Serve admin panel
+app.get('/admin*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'admin', 'index.html'));
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  logger.error(err.stack);
+  res.status(500).json({
+    success: false,
+    message: 'Something broke!',
+    error: process.env.NODE_ENV === 'development' ? err.message : undefined
+  });
+});
+
+// Start server
+app.listen(PORT, () => {
+  logger.info(`Server running on port ${PORT}`);
+  logger.info(`Environment: ${process.env.NODE_ENV}`);
 });
